@@ -1,25 +1,27 @@
 import numpy as np
 import jax.numpy as jnp
-from jax import nn, jacfwd, jit, vmap, lax, random
+from jax import nn, jacfwd, jacrev, jit, vmap, lax, random
 from functools import partial
 import time
 
-# import MCMC library
-import numpyro
-import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS, HMC
+# import scipy's optimizer
+from scipy.optimize import minimize
+
+# import matrix math functions
+from .linalg import *
+
 
 class FFNN():
 
-    def __init__(self, n_inputs, n_hidden, n_outputs, param_0=.2):
+    def __init__(self, n_inputs, n_hidden, n_outputs, rng_key=123):
+
+        # set rng key
+        self.rng_key = random.PRNGKey(rng_key)
 
         # store dimensions
         self.n_inputs = n_inputs
         self.n_hidden = n_hidden
         self.n_outputs = n_outputs
-
-        # bounds on initial parameter guess
-        self.param_0 = param_0
 
         # determine shapes of weights/biases = [Wih, bih, Who, bho]
         self.shapes = [[n_hidden, n_inputs], [n_hidden], [n_outputs, n_hidden], [n_outputs]]
@@ -29,11 +31,15 @@ class FFNN():
             self.k_params.append(self.n_params)
             self.n_params += np.prod(shape)
         self.k_params.append(self.n_params)
-
+            
         # initialize parameters
         self.params = np.zeros(self.n_params)
-        for k1,k2,shape in zip(self.k_params[:-1], self.k_params[1:-1], self.shapes[:-1]):
-            self.params[k1:k2] = np.random.uniform(-self.param_0, self.param_0, k2-k1)
+        for k1,k2,shape in zip(self.k_params, self.k_params[1:], self.shapes):
+            if len(shape)>1:
+                stdv = 1/np.sqrt(shape[-1])
+            # self.params[k1:k2] = random.uniform(self.rng_key, shape=(k2 - k1,),
+            #                                     minval=-self.param_0, maxval=self.param_0)
+            self.params[k1:k2] = stdv*random.normal(self.rng_key, shape=(k2-k1,))
 
         # initialize hyper-parameters
         self.a = 1e-4
@@ -45,340 +51,379 @@ class FFNN():
         ### define jit compiled functions ###
 
         # batch prediction
-        self.forward_batch = jit(vmap(self.forward, in_axes=(None, 0)))
+        self.forward_batch = jit(vmap(self.forward, (None, 0)))
 
         # jit compile gradient w.r.t. params
-        self.G  = jit(jacfwd(self.forward_batch))
         self.Gi = jit(jacfwd(self.forward))
+        self.G = jit(jacfwd(self.forward_batch))
 
-        # jit compile Newton update direction computation
-        def NewtonStep(G, g, alpha, Beta):
-            # compute hessian
-            A = jnp.diag(alpha) + jnp.einsum('nki,kl,nlj->ij', G, Beta, G)
-            # solve for Newton step direction
-            d = jnp.linalg.solve(A, g)
-            return d
-        self.NewtonStep = jit(NewtonStep)
-
-        # jit compile inverse Hessian computation step
-        def Ainv_next(G, Ainv, BetaInv):
-            GAinv = G@Ainv
-            Ainv_step = GAinv.T@jnp.linalg.inv(BetaInv + GAinv@G.T)@GAinv
-            Ainv_step = (Ainv_step + Ainv_step.T)/2.
-            return Ainv_step
-        self.Ainv_next = Ainv_next
-
-        # jit compile measurement covariance computation
-        def compute_yCOV(errors, G, Ainv):
-            return jnp.einsum('nk,nl->kl', errors, errors) + jnp.einsum('nki,ij,nlj->kl', G, Ainv, G)
-        self.compute_yCOV = jit(compute_yCOV)
+        # jit compile function to compute gradient of loss w.r.t. parameters
+        self.compute_grad_NLL = jit(jacrev(self.compute_NLL))
 
     # reshape parameters into weight matrices and bias vectors
     def reshape(self, params):
         # params is a vector = [Wih, bih, Who, bho]
-        return [np.reshape(params[k1:k2], shape) for k1,k2,shape in zip(self.k_params, self.k_params[1:], self.shapes)]
+        return [np.reshape(params[k1:k2], shape) for k1, k2, shape in
+                zip(self.k_params, self.k_params[1:], self.shapes)]
 
     # per-sample prediction
+    @partial(jit, static_argnums=0)
     def forward(self, params, sample):
         # reshape params
         Wih, bih, Who, bho = self.reshape(params)
 
         # hidden layer
-        h = nn.tanh(Wih@sample + bih)
+        h = nn.tanh(Wih @ sample + bih)
 
         # output
-        out = Who@h + bho
+        out = Who @ h + bho
 
         return out
 
-    # fit to data
-    def fit(self, X, Y, lr=1e-2, map_tol=1e-3, evd_tol=1e-3):
-        # fit until convergence of evidence
+    # estimate posterior parameter distribution
+    def fit(self, X, Y, evd_tol=1e-3, nlp_tol=None, alpha_0=1e-3, alpha_1=1., patience=1, max_fails=3):
+
+        # estimate parameters using gradient descent
+        self.itr = 0
+        passes = 0
+        fails = 0
+        convergence = np.inf
         previdence = -np.inf
-        evidence_converged = False
-        epoch = 0
-        best_evidence_params = np.copy(self.params)
-        best_params = np.copy(self.params)
 
-        while not evidence_converged:
+        # init convergence status
+        converged = False
 
-            # update hyper-parameters
-            self.update_hypers(X, Y)
+        # initialize hyper parameters
+        self.init_hypers(X, Y, alpha_0)
 
-            # use Newton descent to determine parameters
-            prev_loss = np.inf
+        while not converged:
+            # update Alpha and Beta hyper-parameters
+            if self.itr > 0: self.update_hypers(X, Y)
 
-            # fit until convergence of NLP
-            converged = False
-            while not converged:
-                # forward passs
-                outputs = self.forward_batch(self.params, X)
-                errors  = np.nan_to_num(outputs - Y)
-                residuals = np.sum(errors)
+            # fit using updated Alpha and Beta
+            self.res = minimize(fun=self.objective,
+                                jac=self.jacobian,
+                                hess=self.hessian,
+                                x0=self.params,
+                                args=(X, Y,),
+                                tol=nlp_tol,
+                                method='Newton-CG') # callback=self.callback)
+            self.params = self.res.x
+            self.loss = self.res.fun
 
-                # compute convergence of loss function
-                loss = self.compute_loss(errors)
-                convergence = (prev_loss - loss) / max([1., loss])
-                if epoch%10==0:
-                    print("Epoch: {}, Loss: {:.5f}, Residuals: {:.5f}, Convergence: {:5f}".format(epoch, loss, residuals, convergence))
+            # update parameter precision matrix (Hessian)
+            # print("Updating precision...")
+            '''if self.itr == 0:
+                self.alpha = alpha_1 * jnp.ones_like(self.params)'''
+            self.update_precision(X, Y)
 
-                # stop if less than tol
-                if abs(convergence) <= map_tol:
-                    # set converged to true to break from loop
-                    converged = True
-                else:
-                    # lower learning rate if convergence is negative
-                    if convergence < 0:
-                        lr /= 2.
-                        # re-try with the smaller step
-                        self.params = best_params - lr*d
-                    else:
-                        # update best params
-                        best_params = np.copy(self.params)
+            # update evidence
+            self.update_evidence()
+            # print("Evidence {:.3f}".format(self.evidence))
 
-                        # update previous loss
-                        prev_loss = loss
+            # check convergence
+            convergence = np.abs(previdence - self.evidence) / np.max([1., np.abs(self.evidence)])
 
-                        # compute gradients
-                        G = self.G(self.params, X)
-                        g = np.einsum('nk,kl,nli->i', errors, self.Beta, G) + self.alpha*self.params
-
-                        # determine Newton update direction
-                        d = self.NewtonStep(G, g, self.alpha, self.Beta)
-
-                        # update parameters
-                        self.params -= lr*d
-
-                        # update epoch counter
-                        epoch += 1
-
-            # Update Hessian estimation
-            G = self.G(self.params, X)
-            self.A, self.Ainv = self.compute_precision(G)
-
-            # compute evidence
-            evidence = self.compute_evidence(X, loss)
-
-            # determine whether evidence is converged
-            evidence_convergence = (evidence - previdence) / max([1., abs(evidence)])
-            print("\nEpoch: {}, Evidence: {:.5f}, Convergence: {:5f}".format(epoch, evidence, evidence_convergence))
-
-            # stop if less than tol
-            if abs(evidence_convergence) <= evd_tol:
-                evidence_converged = True
+            # update pass count
+            if convergence < evd_tol:
+                passes += 1
+                # print("Pass count ", passes)
             else:
-                if evidence_convergence < 0:
-                    # reset :(
-                    self.params = np.copy(best_evidence_params)
-                    # Update Hessian estimation
-                    G = self.G(self.params, X)
-                    self.A, self.Ainv = self.compute_precision(G)
-                    # reset evidence back to what it was
-                    evidence = previdence
-                    # lower learning rate
-                    lr /= 2.
-                else:
-                    # otherwise, update previous evidence value
-                    previdence = evidence
-                    # update measurement covariance
-                    self.yCOV = self.compute_yCOV(errors, G, self.Ainv)
-                    # update best evidence parameters
-                    best_evidence_params = np.copy(self.params)
+                passes = 0
+
+            # increment fails if convergence is negative
+            if self.evidence < previdence:
+                fails += 1
+                # print("Fail count ", fails)
+
+            # finally compute covariance (Hessian inverse)
+            self.update_covariance(X, Y)
+
+            # determine whether algorithm has converged
+            if passes >= patience:
+                converged = True
+
+            # update evidence
+            previdence = np.copy(self.evidence)
+            self.itr += 1
+
+    def callback(self, xk, res=None):
+        print("Loss: {:.3f}, Residuals: {:.3f}".format(self.loss, self.residuals))
+        return True
+
+    # function to compute NLL loss function
+    # @partial(jit, static_argnums=(0,))
+    def compute_NLL(self, params, X, Y, Beta):
+        outputs = self.forward_batch(params, X)
+        error = jnp.nan_to_num(outputs - Y)
+        self.residuals = jnp.sum(error)/X.shape[0]
+        return jnp.einsum('nk,kl,nl->', error, Beta, error) / 2.
+
+    # define objective function
+    def objective(self, params, X, Y):
+        # init loss with parameter penalty
+        self.loss = jnp.dot(self.alpha * params, params) / 2.
+
+        # forward pass
+        self.loss += self.compute_NLL(params, X, Y, self.Beta)
+
+        return self.loss
+
+    # define function to compute gradient of loss w.r.t. parameters
+    def jacobian(self, params, X, Y):
+
+        # gradient of -log prior
+        g = self.alpha * params
+
+        # gradient of -log likelihood
+        g += self.compute_grad_NLL(params, X, Y, self.Beta)
+
+        # return gradient of -log posterior
+        return g
+
+    # define function to compute approximate Hessian
+    def hessian(self, params, X, Y):
+        # init w/ hessian of -log(prior)
+        A = jnp.diag(self.alpha)
+
+        # outer product approximation of Hessian:
+
+        # Compute gradient of model output w.r.t. parameters
+        G = self.G(params, X)
+
+        # update Hessian
+        A += A_next(G, self.Beta)
+
+        return (A + A.T)/2.
+
+    # update hyper-parameters alpha and Beta
+    def init_hypers(self, X, Y, alpha_0):
+        # compute number of independent samples in the data
+        self.N = np.sum(~np.isnan(Y), 0)
+
+        # init alpha
+        self.alpha = alpha_0 * jnp.ones_like(self.params)
+
+        # update Beta
+        self.Beta = jnp.eye(self.n_outputs)
+        self.BetaInv = jnp.eye(self.n_outputs)
 
     # update hyper-parameters alpha and Beta
     def update_hypers(self, X, Y):
-        if self.Ainv is None:
-            self.yCOV = np.einsum('nk,nl->kl', np.nan_to_num(Y), np.nan_to_num(Y))
-            self.yCOV = (self.yCOV + self.yCOV.T)/2.
-            # update alpha
-            self.alpha = np.ones(self.n_params)
-            # update Beta
-            self.Beta = X.shape[0]*np.linalg.inv(self.yCOV + 2.*self.b*np.eye(self.n_outputs))
-            self.Beta = (self.Beta + self.Beta.T)/2.
-            self.BetaInv = np.linalg.inv(self.Beta)
-        else:
-            # update alpha
-            self.alpha = 1. / (self.params**2 + np.diag(self.Ainv) + 2.*self.a)
-            # update beta
-            self.Beta = X.shape[0]*np.linalg.inv(self.yCOV + 2.*self.b*np.eye(self.n_outputs))
-            self.Beta = (self.Beta + self.Beta.T)/2.
-            self.BetaInv = np.linalg.inv(self.Beta)
 
-    # compute loss
-    def compute_loss(self, errors):
-        return 1/2*(np.einsum('nk,kl,nl->', errors, self.Beta, errors) + np.dot(self.alpha*self.params, self.params))
+        # forward
+        outputs = self.forward_batch(self.params, X)
+        error = jnp.nan_to_num(outputs - Y)
 
-    # compute Precision and Covariance matrices
-    def compute_precision(self, G):
-        # compute Hessian (precision Matrix)
-        A = jnp.diag(self.alpha) + jnp.einsum('nki,kl,nlj->ij', G, self.Beta, G)
-        A = (A + A.T)/2.
+        # backward
+        G = self.G(self.params, X)
+
+        # sum of measurement covariance update
+        yCOV = np.sum(error**2, 0) + trace_GGM(G, self.Ainv)
+        
+        # update alpha
+        self.alpha = 1. / (self.params ** 2 + jnp.diag(self.Ainv) + 2. * self.a)
+        # alpha = self.n_params / (jnp.sum(self.params**2) + jnp.trace(self.Ainv) + 2.*self.a)
+        # self.alpha = alpha*jnp.ones_like(self.params)
+
+        # divide by number of observations
+        yCOV = yCOV / self.N
+
+        # update beta
+        self.Beta = jnp.diag(1./(yCOV + self.b))
+        self.BetaInv = jnp.diag(yCOV)
+
+    # compute precision matrix
+    def update_precision(self, X, Y):
 
         # compute inverse precision (covariance Matrix)
-        Ainv = jnp.diag(1./self.alpha)
-        for Gn in G:
-            Ainv -= self.Ainv_next(Gn, Ainv, self.BetaInv)
-        # Ainv = jnp.linalg.inv(A) # <-- faster but less accurate than above
-        return A, Ainv
+        A = np.diag(self.alpha)
+
+        # update A
+        G = self.G(self.params, X)
+        A += A_next(G, self.Beta)
+
+        # make sure that matrices are symmetric and positive definite
+        self.A, _ = make_pos_def((A + A.T)/2., self.alpha)
+
+    # compute covariance matrix
+    def update_covariance(self, X, Y):
+
+        ### fast / approximate method: ###
+        # self.Ainv, _ = make_pos_def(compute_Ainv(self.A), jnp.ones(self.n_params))
+
+        # compute inverse precision (covariance Matrix)
+        self.Ainv = np.diag(1./self.alpha)
+
+        # update Ainv
+        G = self.G(self.params, X)
+        for Gi in G:
+            self.Ainv -= Ainv_next(Gi, self.Ainv, self.BetaInv) 
+
+        # make sure Ainv is positive definite
+        self.Ainv, _ = make_pos_def((self.Ainv + self.Ainv.T)/2., jnp.ones_like(self.alpha))
 
     # compute the log marginal likelihood
-    def compute_evidence(self, X, loss):
+    def update_evidence(self):
         # compute evidence
-        Hessian_eigs = np.linalg.eigvalsh(self.A)
-        evidence = X.shape[0]/2*np.nansum(np.log(np.linalg.eigvalsh(self.Beta))) + \
-                   1/2*np.nansum(np.log(self.alpha)) - \
-                   1/2*np.nansum(np.log(Hessian_eigs[Hessian_eigs>0])) - loss
-        return evidence
+        self.evidence = 1 / 2 * np.sum(self.N*np.log(np.diag(self.Beta))) + \
+                        1 / 2 * np.nansum(np.log(self.alpha)) - \
+                        1 / 2 * log_det(self.A) - self.loss
 
-    def fit_MCMC(self, X, Y, num_warmup=1000, num_samples=4000, rng_key=0):
-
-        # define probabilistic model
-        def pyro_model():
-
-            # sample from Laplace approximated posterior
-            w = numpyro.sample("w",
-                               dist.MultivariateNormal(loc=self.params,
-                                                       covariance_matrix=self.Ainv))
-
-            # sample from zero-mean Gaussian prior with independent precision priors
-            '''with numpyro.plate("params", self.n_params):
-                alpha = numpyro.sample("alpha", dist.Exponential(rate=1e-4))
-                w = numpyro.sample("w", dist.Normal(loc=0., scale=(1./alpha)**.5))'''
-
-            # sample from zero-mean Gaussian prior with single precision prior
-            '''alpha = numpyro.sample("alpha", dist.Exponential(rate=1e-4))
-            w = numpyro.sample("w", dist.MultivariateNormal(loc=np.zeros(self.n_params),
-                                                            precision_matrix=alpha*np.eye(self.n_params)))'''
-
-            # output of neural network:
-            preds = self.forward_batch(w, X)
-
-            # sample model likelihood with max evidence precision matrix
-            numpyro.sample("Y",
-                           dist.MultivariateNormal(loc=preds, precision_matrix=self.Beta),
-                           obs = Y)
-
-        # init MCMC object with NUTS kernel
-        kernel = NUTS(pyro_model, step_size=1.)
-        self.mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples)
-
-        # warmup
-        self.mcmc.warmup(random.PRNGKey(rng_key), init_params=self.params)
-
-        # run MCMC
-        self.mcmc.run(random.PRNGKey(rng_key), init_params=self.params)
-
-        # save posterior params
-        self.posterior_params = np.array(self.mcmc.get_samples()['w'])
-
-    # function to predict metabolites and variance
-    def predict(self, X):
+    # function to predict mean of outcomes
+    def predict_point(self, X):
         # make point predictions
         preds = self.forward_batch(self.params, X)
+
+        return preds
+        
+    # function to predict mean of outcomes
+    def predict_point_params(self, X, params):
+        # make point predictions
+        preds = self.forward_batch(params, X)
+
+        return preds
+
+    # function to predict mean and stdv of outcomes
+    def predict(self, X):
+
+        # function to get diagonal of a tensor
+        get_diag = vmap(jnp.diag, (0,))
+
+        # point estimates
+        preds = np.array(self.predict_point(X))
 
         # compute sensitivities
         G = self.G(self.params, X)
 
         # compute covariances
-        COV = self.BetaInv + np.einsum("nki,ij,nlj->nkl", G, self.Ainv, G)
+        COV = np.array(compute_predCOV(self.BetaInv, G, self.Ainv))
+
+        # pull out standard deviations
+        stdvs = np.sqrt(get_diag(COV))
+
+        return preds, stdvs
+
+    # function to predict mean and stdv of outcomes given updated covariance
+    def conditional_predict(self, X, Ainv):
+
+        # function to get diagonal of a tensor
+        get_diag = vmap(jnp.diag, (0,))
+
+        # point estimates
+        preds = self.predict_point(X)
+
+        # compute sensitivities
+        G = self.G(self.params, X)
+
+        # compute covariances
+        COV = compute_epistemic_COV(G, Ainv)
+
+        # pull out standard deviations
+        stdvs = jnp.sqrt(get_diag(COV))
+
+        return preds, stdvs
+    
+    # function to predict variance at X given precision A
+    def conditioned_stdv(self, X, Ainv):
+
+        # compute sensitivities
+        G = self.G(self.params, X)
+
+        # compute updated *epistemic* prediction covariance
+        COV = np.einsum("nki,ij,nlj->nkl", G, Ainv, G) + self.BetaInv
 
         # pull out standard deviations
         get_diag = vmap(jnp.diag, (0,))
         stdvs = np.sqrt(get_diag(COV))
 
-        return preds, stdvs, COV
-
-    # function to predict from posterior samples
-    def predict_MCMC(self, X):
-        # make point predictions
-        preds = jit(vmap(lambda params: self.forward_batch(params, X), (0,)))(self.posterior_params)
-
-        # take mean and standard deviation
-        stdvs = np.sqrt(np.diag(self.BetaInv) + np.var(preds, 0))
-        preds = np.mean(preds, 0)
-
-        return preds, stdvs
+        return stdvs    
 
     # return indeces of optimal samples
-    def search(self, data, objective, scaler, N,
-               batch_size=512, explore = .5, max_explore = 1e3):
+    def search(self, data, objective, N, max_reps=1, batch_size=512, exploit=True):
 
         # determine number of samples to search over
         n_samples = data.shape[0]
         batch_size = min([n_samples, batch_size])
 
-        # compute objective (f: R^[n_t, n_o, w_exp] -> R) in batches
-        objective_batch = jit(vmap(lambda pred, stdv, explore: objective(scaler.inverse_transform(pred),
-                                                                         scaler.inverse_transform(stdv),
-                                                                         explore), (0,0,None)))
-
-        # initialize search with pure exploitation
-        objectives = []
+        # make predictions once
         all_preds  = []
         for batch_inds in np.array_split(np.arange(n_samples), n_samples//batch_size):
             # make predictions on data
-            preds = self.predict_point(data[batch_inds])
-            # evaluate objectives with zero uncertainty
-            objectives.append(objective_batch(preds, 0.*preds, 1.))
-            # save predictions so that they're only evaluated once
-            all_preds.append(preds)
-        objectives = jnp.concatenate(objectives)
-        print("Top 5 utilities: ", jnp.sort(objectives)[::-1][:5])
-
-        if explore <= 0.:
-            print("Pure exploitation, returning N max objective experiments")
-            return np.array(jnp.argsort(objectives)[::-1][:N])
-
-        # initialize with sample that maximizes objective
-        best_experiments = [np.argmax(objectives).item()]
-        print(f"Picked experiment {len(best_experiments)} out of {N}")
+            all_preds.append(self.forward_batch(self.params, data[batch_inds]))
+        
+        # compute objective (f: R^[n_t, n_o, w_exp] -> R) in batches
+        objective_batch = jit(vmap(lambda pred, stdv: objective(pred, stdv), (0,0)))
 
         # initialize conditioned parameter covariance
         Ainv_q = jnp.copy(self.Ainv)
-        Gi = self.Gi(self.params, data[np.argmax(objectives)])
-        # update conditioned parameter covariance
-        for Gt in Gi:
-            Ainv_q -= self.Ainv_next(Gt, Ainv_q, self.BetaInv)
 
         # search for new experiments until find N
-        eval_utilities = True
+        best_experiments = []
         while len(best_experiments) < N:
 
             # compute utilities in batches to avoid memory problems
             utilities = []
             for preds, batch_inds in zip(all_preds, np.array_split(np.arange(n_samples), n_samples//batch_size)):
                 stdvs = self.conditioned_stdv(data[batch_inds], Ainv_q)
-                utilities.append(objective_batch(preds, stdvs, explore))
-            utilities = jnp.concatenate(utilities)
-            print("Top 5 utilities: ", jnp.sort(utilities)[::-1][:5])
-
-            # sort utilities from best to worst
-            exp_sorted = jnp.argsort(utilities)[::-1]
-            for exp in exp_sorted:
-                # accept if unique
-                if exp not in best_experiments:
-                    best_experiments += [exp.item()]
-                    # compute sensitivity to sample
-                    Gi = self.Gi(self.params, data[exp])
-                    # update conditioned parameter covariance
-                    for Gt in Gi:
-                        Ainv_q -= self.Ainv_next(Gt, Ainv_q, self.BetaInv)
-                    print(f"Picked experiment {len(best_experiments)} out of {N}")
-                    if eval_utilities:
-                        break
-                    # IF already exceed max exploration
-                    # AND have enough selected experiments, return
-                    if len(best_experiments) == N:
-                        return best_experiments
-
-                # increase exploration if not unique
-                elif explore < max_explore:
-                    explore *= 2.
-                    print("Increased exploration rate to {:.3f}".format(explore))
-                    break
+                if exploit:
+                    utilities.append(objective_batch(preds, stdvs))
                 else:
-                    # if the same experiment was picked twice at the max
-                    # exploration rate, do not re-evaluate utilities
-                    eval_utilities = False
+                    utilities.append(stdvs)
+            utilities = jnp.concatenate(utilities)
+            # print("Top 5 utilities: ", jnp.sort(utilities)[::-1][:5])
+            
+            # pick an experiment
+            # print(f"Picked experiment {len(best_experiments)} out of {N}")
+            exp = np.argmax(utilities)
 
-        return best_experiments
+            # condition posterior on selected sample
+            Gi = self.Gi(self.params, data[exp])
+            Ainv_q -= Ainv_next(Gi, Ainv_q, self.BetaInv)
+
+            # switch to pure exploration if same samples keep getting picked
+            if sum(np.in1d(best_experiments, exp)) < max_reps:
+                # add experiment to the list
+                best_experiments += [exp.item()]
+            else:
+                if exploit:
+                    print("Max replicates exceeded, switching to pure exploration")
+                    exploit=False
+                else:
+                    print("Max exploration replicates exceeded, terminating")
+                    return np.sort(best_experiments)
+
+        return np.sort(best_experiments)
+    
+    # return indeces of optimal samples
+    def Thompson_search(self, data, objective, N, max_reps=1, batch_size=512, exploit=True):
+
+        # determine number of samples to search over
+        n_samples = data.shape[0]
+        batch_size = min([n_samples, batch_size])  
+    
+        # compute objective (f: R^[n_t, n_o, w_exp] -> R) in batches
+        objective_batch = jit(vmap(lambda pred: objective(pred)))
+
+        # search for new experiments until find N
+        best_experiments = []
+        k = 1
+        while len(best_experiments) < N:
+
+            # sample parameters 
+            params = sample(self.params, self.Ainv, k)
+            k += 1
+
+            # make predictions once
+            utilities  = []
+            for batch_inds in np.array_split(np.arange(n_samples), n_samples//batch_size):
+                # make predictions on data
+                utilities.append(objective_batch(self.forward_batch(params, data[batch_inds])))
+            
+            # pick an experiment
+            exp = np.argmax(np.concatenate(utilities))
+            
+            # add experiment to the list 
+            best_experiments += [exp.item()]
+
+        return np.sort(best_experiments)

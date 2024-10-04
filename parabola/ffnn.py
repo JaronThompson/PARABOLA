@@ -1,6 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
 from jax import nn, jacfwd, jacrev, jit, vmap, lax, random
+from jax.scipy.stats.norm import cdf, pdf
 from functools import partial
 import time
 
@@ -74,6 +75,9 @@ class FFNN():
 
         # hidden layer
         h = nn.tanh(Wih @ sample + bih)
+
+        # looks super bizarre on cosines data
+        # h = nn.leaky_relu(Wih @ sample + bih)
 
         # output
         out = Who @ h + bho
@@ -340,7 +344,7 @@ class FFNN():
         return stdvs    
 
     # return indeces of optimal samples
-    def search(self, data, objective, N, max_reps=1, batch_size=512, exploit=True):
+    def search_EI_old(self, data, objective, N, max_reps=1, batch_size=512, exploit=True):
 
         # determine number of samples to search over
         n_samples = data.shape[0]
@@ -394,36 +398,192 @@ class FFNN():
                     return np.sort(best_experiments)
 
         return np.sort(best_experiments)
-    
-    # return indeces of optimal samples
-    def Thompson_search(self, data, objective, N, max_reps=1, batch_size=512, exploit=True):
 
-        # determine number of samples to search over
-        n_samples = data.shape[0]
-        batch_size = min([n_samples, batch_size])  
-    
-        # compute objective (f: R^[n_t, n_o, w_exp] -> R) in batches
-        objective_batch = jit(vmap(lambda pred: objective(pred)))
+    # search for next best experiment
+    def get_next_experiment(self, f_P, f_I, best_experiments, explore, max_explore):
+
+        # init with previous selected experiment
+        next_experiment = best_experiments[-1]
+        w = np.copy(explore)
+        while next_experiment in best_experiments and w < max_explore:
+
+            # evaluate utility of each experimental condition
+            utilities = f_P + w * f_I
+
+            # select next best condition
+            next_experiment = np.argmax(utilities).item()
+
+            # increase exploration rate
+            w *= 1.1  # = w + explore
+
+        return next_experiment, w
+
+    # return indeces of optimal samples
+    def search_EIG(self, data, objective, N, explore=.001, max_explore=1000, max_reps=1):
+
+        # compute objective (f: R^n_out -> R) in batches
+        objective_batch = jit(vmap(objective))
+
+        # make predictions once
+        f_P = objective_batch(self.forward_batch(self.params, data)).ravel()
+
+        # init experiments with max predicted objective
+        best_experiments = [np.argmax(f_P).item()]
+
+        # initialize conditioned parameter covariance
+        Ainv_q = jnp.copy(self.Ainv)
+
+        # compute sensitivities for all samples
+        G = self.G(self.params, data)
+
+        # search for new experiments until find N
+        while len(best_experiments) < N:
+
+            # condition posterior on selected sample
+            Ainv_q -= Ainv_next(G[best_experiments[-1]], Ainv_q, self.BetaInv)
+
+            # compute covariances
+            COV = compute_predCOV(self.BetaInv, G, Ainv_q)
+
+            # computed EIG for each condition
+            f_I = batch_log_det(COV)
+
+            # get next experiment
+            exp, w = self.get_next_experiment(f_P, f_I, best_experiments, explore, max_explore)
+            print("Explore rate: ", w)
+
+            # switch to pure exploration if same samples keep getting picked
+            if sum(np.in1d(best_experiments, exp)) < max_reps:
+                # add experiment to the list
+                best_experiments += [exp]
+            else:
+                print("Max exploration replicates exceeded, terminating")
+                return np.sort(best_experiments)
+
+        return np.sort(best_experiments)
+
+    # return indeces of optimal samples
+    def search_explore(self, data, N, max_reps=1):
+
+        # initialize conditioned parameter covariance
+        Ainv_q = jnp.copy(self.Ainv)
+
+        # compute sensitivities for all samples
+        G = self.G(self.params, data)
 
         # search for new experiments until find N
         best_experiments = []
-        k = 1
         while len(best_experiments) < N:
 
-            # sample parameters 
-            params = sample(self.params, self.Ainv, k)
-            k += 1
+            # condition posterior on selected sample
+            if len(best_experiments) > 0:
+                Ainv_q -= Ainv_next(G[best_experiments[-1]], Ainv_q, self.BetaInv)
 
-            # make predictions once
-            utilities  = []
-            for batch_inds in np.array_split(np.arange(n_samples), n_samples//batch_size):
-                # make predictions on data
-                utilities.append(objective_batch(self.forward_batch(params, data[batch_inds])))
-            
-            # pick an experiment
-            exp = np.argmax(np.concatenate(utilities))
-            
-            # add experiment to the list 
-            best_experiments += [exp.item()]
+            # compute covariances
+            COV = np.array(compute_predCOV(self.BetaInv, G, Ainv_q))
+
+            # computed EIG for each condition
+            f_I = batch_log_det(COV)
+
+            # get next experiment
+            exp = np.argmax(f_I).item()
+
+            # switch to pure exploration if same samples keep getting picked
+            if sum(np.in1d(best_experiments, exp)) < max_reps:
+                # add experiment to the list
+                best_experiments += [exp]
+            else:
+                print("Max exploration replicates exceeded, terminating")
+                return np.sort(best_experiments)
+
+        return np.sort(best_experiments)
+    
+    # return indeces of optimal samples
+    def search_Thompson(self, data, objective, N, max_reps=1):
+
+        # compute objective (f: R^n_out -> R) in batches
+        objective_batch = jit(vmap(objective))
+
+        # make predictions once
+        pred_mean, pred_stdv = self.predict(data)
+
+        # evaluate best guess of objectives
+        f_P = objective_batch(pred_mean).ravel()
+
+        # init experiments with max predicted objective
+        best_experiments = [np.argmax(f_P).item()]
+
+        # search for new experiments until find N
+        while len(best_experiments) < N:
+
+            # sample from posterior predictive
+            pred_sample = pred_mean + np.random.randn(*pred_stdv.shape) * pred_stdv
+
+            # evaluate objectives
+            f_P = objective_batch(pred_sample).ravel()
+
+            # best sample
+            exp = np.argmax(f_P).item()
+
+            # switch to pure exploration if same samples keep getting picked
+            if sum(np.in1d(best_experiments, exp)) < max_reps:
+                # add experiment to the list
+                best_experiments += [exp]
+            else:
+                print("Max exploration replicates exceeded, terminating")
+                return np.sort(best_experiments)
+
+        return np.sort(best_experiments)
+
+    # return indeces of optimal samples
+    def search_EI(self, data, objective, N, max_reps=1):
+
+        # make predictions once
+        pred_mean = self.forward_batch(self.params, data).ravel()
+
+        # init experiments with max predicted objective
+        best_experiments = [np.argmax(pred_mean).item()]
+
+        # function to get diagonal of tensor
+        get_diag = vmap(jnp.diag, (0,))
+
+        # best expected value
+        fstar = np.max(pred_mean)
+
+        # initialize conditioned parameter covariance
+        Ainv_q = jnp.copy(self.Ainv)
+
+        # compute sensitivities for all samples
+        G = self.G(self.params, data)
+
+        # search for new experiments until find N
+        while len(best_experiments) < N:
+
+            # condition posterior on selected sample
+            Ainv_q -= Ainv_next(G[best_experiments[-1]], Ainv_q, self.BetaInv)
+
+            # compute covariances
+            COV = compute_predCOV(self.BetaInv, G, Ainv_q)
+
+            # predicted standard deviations
+            pred_stdv = np.sqrt(get_diag(COV)).ravel()
+
+            # compute probability of other conditions being better than expected best
+            # Z = difference / pred_stdv
+            # f_I = difference * cdf(Z) + pred_stdv * pdf(Z)
+            f_I = 1. - cdf(fstar, loc=pred_mean, scale=pred_stdv)
+            print(f_I)
+
+            # get next exp
+            exp = np.argmax(f_I).item()
+            print(exp)
+
+            # switch to pure exploration if same samples keep getting picked
+            if sum(np.in1d(best_experiments, exp)) < max_reps:
+                # add experiment to the list
+                best_experiments += [exp]
+            else:
+                print("Max exploration replicates exceeded, terminating")
+                return np.sort(best_experiments)
 
         return np.sort(best_experiments)

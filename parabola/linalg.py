@@ -67,7 +67,7 @@ def A_next_mix(Gm, Gs, stdvs, mixs):
 def log_det(A):
     L = jnp.linalg.cholesky(A)
     return 2 * jnp.sum(jnp.log(jnp.diag(L)))
-
+batch_log_det = jit(vmap(log_det))
 
 # jit compile inverse Hessian computation step
 @jit
@@ -119,6 +119,7 @@ def compute_predCOV_diag(BetaInv, G, Ainv):
 @jit
 def compute_predCOV_hs(Gm, Gs, Ainv):
     return jnp.einsum("nki,ij,nlj->nkl", Gm, Ainv, Gm) + jnp.einsum("nki,ij,nlj->nkl", Gs, Ainv, Gs)
+
 
 @jit
 def sample(mu, cov, rng):        

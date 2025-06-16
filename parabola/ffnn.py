@@ -226,9 +226,9 @@ class FFNN():
         yCOV = np.sum(error**2, 0) + trace_GGM(G, self.Ainv)
         
         # update alpha
-        self.alpha = 1. / (self.params ** 2 + jnp.diag(self.Ainv) + 2. * self.a)
-        # alpha = self.n_params / (jnp.sum(self.params**2) + jnp.trace(self.Ainv) + 2.*self.a)
-        # self.alpha = alpha*jnp.ones_like(self.params)
+        # self.alpha = 1. / (self.params ** 2 + jnp.diag(self.Ainv) + 2. * self.a)
+        alpha = self.n_params / (jnp.sum(self.params**2) + jnp.trace(self.Ainv) + 2.*self.a)
+        self.alpha = alpha*jnp.ones_like(self.params)
 
         # divide by number of observations
         yCOV = yCOV / self.N
@@ -344,7 +344,7 @@ class FFNN():
         return stdvs    
 
     # return indeces of optimal samples
-    def search_EI_old(self, data, objective, N, max_reps=1, batch_size=512, exploit=True):
+    def search_EI(self, data, objective, N, max_reps=1, batch_size=512, exploit=True):
 
         # determine number of samples to search over
         n_samples = data.shape[0]
@@ -386,7 +386,7 @@ class FFNN():
             Ainv_q -= Ainv_next(Gi, Ainv_q, self.BetaInv)
 
             # switch to pure exploration if same samples keep getting picked
-            if sum(np.in1d(best_experiments, exp)) < max_reps:
+            if sum(np.isin(best_experiments, exp)) < max_reps:
                 # add experiment to the list
                 best_experiments += [exp.item()]
             else:
@@ -524,59 +524,6 @@ class FFNN():
 
             # best sample
             exp = np.argmax(f_P).item()
-
-            # switch to pure exploration if same samples keep getting picked
-            if sum(np.in1d(best_experiments, exp)) < max_reps:
-                # add experiment to the list
-                best_experiments += [exp]
-            else:
-                print("Max exploration replicates exceeded, terminating")
-                return np.sort(best_experiments)
-
-        return np.sort(best_experiments)
-
-    # return indeces of optimal samples
-    def search_EI(self, data, objective, N, max_reps=1):
-
-        # make predictions once
-        pred_mean = self.forward_batch(self.params, data).ravel()
-
-        # init experiments with max predicted objective
-        best_experiments = [np.argmax(pred_mean).item()]
-
-        # function to get diagonal of tensor
-        get_diag = vmap(jnp.diag, (0,))
-
-        # best expected value
-        fstar = np.max(pred_mean)
-
-        # initialize conditioned parameter covariance
-        Ainv_q = jnp.copy(self.Ainv)
-
-        # compute sensitivities for all samples
-        G = self.G(self.params, data)
-
-        # search for new experiments until find N
-        while len(best_experiments) < N:
-
-            # condition posterior on selected sample
-            Ainv_q -= Ainv_next(G[best_experiments[-1]], Ainv_q, self.BetaInv)
-
-            # compute covariances
-            COV = compute_predCOV(self.BetaInv, G, Ainv_q)
-
-            # predicted standard deviations
-            pred_stdv = np.sqrt(get_diag(COV)).ravel()
-
-            # compute probability of other conditions being better than expected best
-            # Z = difference / pred_stdv
-            # f_I = difference * cdf(Z) + pred_stdv * pdf(Z)
-            f_I = 1. - cdf(fstar, loc=pred_mean, scale=pred_stdv)
-            print(f_I)
-
-            # get next exp
-            exp = np.argmax(f_I).item()
-            print(exp)
 
             # switch to pure exploration if same samples keep getting picked
             if sum(np.in1d(best_experiments, exp)) < max_reps:
